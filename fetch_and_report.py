@@ -2,6 +2,10 @@ import os
 import sys
 from datetime import date
 import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # Ensure stdout handles UTF-8 (needed on Windows with cp1252 terminals)
 if hasattr(sys.stdout, "reconfigure"):
@@ -17,8 +21,6 @@ TICKERS = {
 }
 
 ORDER = ["10Y Yield (TNX)", "DXY", "5Y Yield (FVX)", "VIX", "Nasdaq", "BTC"]
-
-BLOCKS = "▁▂▃▄▅▆▇█"
 
 
 def fetch_series(ticker):
@@ -63,39 +65,83 @@ def fmt_price(name, value):
     return f"{value:.1f}"
 
 
-def sparkline(series, n_days, width):
-    """Build an ASCII sparkline from the last n_days of data, resampled to `width` chars."""
-    sub = series.iloc[-n_days:] if len(series) >= n_days else series
+def plot_panel(ax, series, n_days, name):
+    """Plot a single price history panel on the given axes."""
+    sub = series.iloc[-n_days:]
     if len(sub) < 2:
-        return BLOCKS[3] * width
-    # resample to `width` evenly-spaced points
-    if len(sub) <= width:
-        sampled = list(sub)
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    dates = sub.index.to_pydatetime()
+    vals = sub.values.astype(float)
+
+    color = "#27ae60" if vals[-1] >= vals[0] else "#e74c3c"
+
+    ax.plot(dates, vals, color=color, linewidth=1.5)
+    ax.fill_between(dates, vals, vals.min(), alpha=0.12, color=color)
+
+    # Dashed baseline at period-start value
+    ax.axhline(vals[0], color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
+
+    # Date formatting
+    if n_days <= 31:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
     else:
-        sampled = [
-            sub.iloc[int(i * (len(sub) - 1) / (width - 1))]
-            for i in range(width)
-        ]
-    lo, hi = min(sampled), max(sampled)
-    if hi == lo:
-        return BLOCKS[3] * len(sampled)
-    return "".join(
-        BLOCKS[min(7, int((v - lo) / (hi - lo) * 7.999))]
-        for v in sampled
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=7)
+
+    # Stats text box
+    delta_pct = (vals[-1] - vals[0]) / vals[0] * 100
+    sign = "+" if delta_pct >= 0 else ""
+    hi_val = fmt_price(name, vals.max())
+    lo_val = fmt_price(name, vals.min())
+    cur_val = fmt_price(name, vals[-1])
+    stats = f"{cur_val}  {sign}{delta_pct:.1f}%\nhi {hi_val}  lo {lo_val}"
+    ax.text(
+        0.02, 0.97, stats,
+        transform=ax.transAxes,
+        fontsize=7,
+        verticalalignment="top",
+        bbox=dict(boxstyle="square,pad=0.3", facecolor="white", edgecolor="none"),
     )
 
+    # Clean spines and grid
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.set_tick_params(labelsize=7)
+    ax.grid(True, alpha=0.25)
 
-def trend_row(name, series, n_days, width, label):
-    """Return a single trend line: label + sparkline + start→end + range."""
-    if series is None:
-        return f"  {label}: N/A"
-    sub = series.iloc[-n_days:] if len(series) >= n_days else series
-    spark = sparkline(series, n_days, width)
-    start = fmt_price(name, sub.iloc[0])
-    end = fmt_price(name, sub.iloc[-1])
-    lo = fmt_price(name, sub.min())
-    hi = fmt_price(name, sub.max())
-    return f"  {label}: `{spark}`  {start} → {end}  (range {lo} – {hi})"
+
+def save_charts(today_str, data, out_path):
+    """Generate a 6×2 PDF chart (1M left, 1Y right) for all indicators."""
+    fig, axes = plt.subplots(6, 2, figsize=(13, 18))
+    fig.suptitle(f"Macro Snapshot — {today_str}", fontsize=14, fontweight="bold", y=0.995)
+
+    # Column headers
+    axes[0, 0].set_title("1 Month", fontsize=10, fontweight="bold")
+    axes[0, 1].set_title("1 Year", fontsize=10, fontweight="bold")
+
+    for row, name in enumerate(ORDER):
+        s = data.get(name)
+        axes[row, 0].set_ylabel(name, fontsize=8, labelpad=4)
+
+        if s is None:
+            for col in (0, 1):
+                axes[row, col].text(
+                    0.5, 0.5, "N/A", ha="center", va="center",
+                    transform=axes[row, col].transAxes
+                )
+            continue
+
+        plot_panel(axes[row, 0], s, n_days=22,  name=name)
+        plot_panel(axes[row, 1], s, n_days=252, name=name)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.995])
+    fig.savefig(out_path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
 
 
 def build_report(today_str, data):
@@ -124,21 +170,11 @@ def build_report(today_str, data):
             f"| Trend(20D): {t}"
         )
 
-    # ── Trends ───────────────────────────────────────────────────────────────
     lines.append("")
-    lines.append("## Trends")
-    lines.append("")
-    lines.append("> Each bar = one sampled price point. `▁` = period low, `█` = period high.")
-    lines.append("")
-
-    for name in ORDER:
-        s = data.get(name)
-        lines.append(f"**{name}**")
-        lines.append(trend_row(name, s, n_days=22,  width=22, label="1M"))
-        lines.append(trend_row(name, s, n_days=252, width=40, label="1Y"))
-        lines.append("")
+    lines.append(f"*Charts: macro_{today_str}.pdf*")
 
     # ── BTC vs Nasdaq ────────────────────────────────────────────────────────
+    lines.append("")
     lines.append("## BTC vs Nasdaq (20D)")
     lines.append("")
 
@@ -220,6 +256,10 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"\nSaved to {out_path}")
+
+    pdf_path = os.path.join("reports", f"macro_{today_str}.pdf")
+    save_charts(today_str, data, pdf_path)
+    print(f"Charts saved to {pdf_path}")
 
 
 if __name__ == "__main__":
