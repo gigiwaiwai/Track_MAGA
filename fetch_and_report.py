@@ -18,10 +18,12 @@ TICKERS = {
 
 ORDER = ["10Y Yield (TNX)", "DXY", "5Y Yield (FVX)", "VIX", "Nasdaq", "BTC"]
 
+BLOCKS = "▁▂▃▄▅▆▇█"
+
 
 def fetch_series(ticker):
     try:
-        df = yf.download(ticker, period="35d", auto_adjust=True, progress=False)
+        df = yf.download(ticker, period="13mo", auto_adjust=True, progress=False)
         s = df["Close"].squeeze().dropna()
         if len(s) < 2:
             return None
@@ -61,10 +63,47 @@ def fmt_price(name, value):
     return f"{value:.1f}"
 
 
+def sparkline(series, n_days, width):
+    """Build an ASCII sparkline from the last n_days of data, resampled to `width` chars."""
+    sub = series.iloc[-n_days:] if len(series) >= n_days else series
+    if len(sub) < 2:
+        return BLOCKS[3] * width
+    # resample to `width` evenly-spaced points
+    if len(sub) <= width:
+        sampled = list(sub)
+    else:
+        sampled = [
+            sub.iloc[int(i * (len(sub) - 1) / (width - 1))]
+            for i in range(width)
+        ]
+    lo, hi = min(sampled), max(sampled)
+    if hi == lo:
+        return BLOCKS[3] * len(sampled)
+    return "".join(
+        BLOCKS[min(7, int((v - lo) / (hi - lo) * 7.999))]
+        for v in sampled
+    )
+
+
+def trend_row(name, series, n_days, width, label):
+    """Return a single trend line: label + sparkline + start→end + range."""
+    if series is None:
+        return f"  {label}: N/A"
+    sub = series.iloc[-n_days:] if len(series) >= n_days else series
+    spark = sparkline(series, n_days, width)
+    start = fmt_price(name, sub.iloc[0])
+    end = fmt_price(name, sub.iloc[-1])
+    lo = fmt_price(name, sub.min())
+    hi = fmt_price(name, sub.max())
+    return f"  {label}: `{spark}`  {start} → {end}  (range {lo} – {hi})"
+
+
 def build_report(today_str, data):
     lines = []
     lines.append(f"# Macro Snapshot - {today_str}")
     lines.append("")
+
+    # ── Indicators ──────────────────────────────────────────────────────────
     lines.append("## Indicators")
     lines.append("")
 
@@ -85,7 +124,21 @@ def build_report(today_str, data):
             f"| Trend(20D): {t}"
         )
 
+    # ── Trends ───────────────────────────────────────────────────────────────
     lines.append("")
+    lines.append("## Trends")
+    lines.append("")
+    lines.append("> Each bar = one sampled price point. `▁` = period low, `█` = period high.")
+    lines.append("")
+
+    for name in ORDER:
+        s = data.get(name)
+        lines.append(f"**{name}**")
+        lines.append(trend_row(name, s, n_days=22,  width=22, label="1M"))
+        lines.append(trend_row(name, s, n_days=252, width=40, label="1Y"))
+        lines.append("")
+
+    # ── BTC vs Nasdaq ────────────────────────────────────────────────────────
     lines.append("## BTC vs Nasdaq (20D)")
     lines.append("")
 
@@ -103,11 +156,11 @@ def build_report(today_str, data):
     else:
         lines.append("- BTC - Nasdaq (20D): N/A")
 
+    # ── 信号提示 ─────────────────────────────────────────────────────────────
     lines.append("")
     lines.append("## 信号提示（不做结论，仅倾向性提示）")
     lines.append("")
 
-    # Real rates signal (10Y proxy)
     tnx_s = data.get("10Y Yield (TNX)")
     tnx_r20 = pct_change(tnx_s, 20) if tnx_s is not None else None
     if tnx_r20 is not None:
@@ -116,7 +169,6 @@ def build_report(today_str, data):
             f"- Real rates {direction} ({fmt_pct(tnx_r20)} 20D)：通常对黄金偏{'压制' if tnx_r20 > 0 else '支撑'}"
         )
 
-    # DXY signal
     dxy_s = data.get("DXY")
     dxy_r20 = pct_change(dxy_s, 20) if dxy_s is not None else None
     if dxy_r20 is not None:
@@ -125,7 +177,6 @@ def build_report(today_str, data):
             f"- DXY {direction} ({fmt_pct(dxy_r20)} 20D)：通常对风险资产偏{'压制' if dxy_r20 > 0 else '支撑'}"
         )
 
-    # VIX signal
     vix_s = data.get("VIX")
     vix_r20 = pct_change(vix_s, 20) if vix_s is not None else None
     if vix_r20 is not None:
@@ -134,7 +185,6 @@ def build_report(today_str, data):
             f"- VIX {direction} ({fmt_pct(vix_r20)} 20D)：风险偏好{'下降' if vix_r20 > 0 else '上升'}"
         )
 
-    # BTC vs Nasdaq signal
     if btc_ret20 is not None and nas_ret20 is not None:
         diff = btc_ret20 - nas_ret20
         direction = "走强" if diff > 0 else "走弱"
