@@ -1,7 +1,10 @@
+import io
 import os
 import sys
-from datetime import date
+import requests
+from datetime import date, datetime, timedelta
 import yfinance as yf
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,13 +23,60 @@ TICKERS = {
     "BTC": "BTC-USD",
 }
 
-ORDER = ["10Y Yield (TNX)", "DXY", "5Y Yield (FVX)", "VIX", "Nasdaq", "BTC"]
+# FRED series fetched directly (no API key needed)
+FRED_SERIES = {
+    "2Y Yield (DGS2)": "DGS2",
+}
+
+ORDER = [
+    "10Y Yield (TNX)",
+    "2Y Yield (DGS2)",
+    "DXY",
+    "5Y Yield (FVX)",
+    "VIX",
+    "Nasdaq",
+    "BTC",
+]
+
+DESCRIPTIONS = {
+    "10Y Yield (TNX)": "10-yr Treasury — long-term rate benchmark",
+    "2Y Yield (DGS2)": "2-yr Treasury — tracks near-term Fed expectations",
+    "DXY": "USD Index — trade-weighted vs major currencies",
+    "5Y Yield (FVX)": "5-yr Treasury — medium-term rate",
+    "VIX": "CBOE fear gauge — 30-day implied S&P vol",
+    "Nasdaq": "Nasdaq Composite — tech-heavy equity index",
+    "BTC": "Bitcoin spot price in USD",
+}
 
 
 def fetch_series(ticker):
     try:
         df = yf.download(ticker, period="13mo", auto_adjust=True, progress=False)
         s = df["Close"].squeeze().dropna()
+        if len(s) < 2:
+            return None
+        return s
+    except Exception:
+        return None
+
+
+def fetch_fred_series(series_id):
+    """Fetch a FRED series via their public CSV endpoint (no API key needed)."""
+    try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        df = pd.read_csv(
+            io.StringIO(r.text),
+            parse_dates=["observation_date"],
+            index_col="observation_date",
+        )
+        df = df.replace(".", float("nan"))
+        df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
+        s = df[series_id].dropna()
+        # Keep only last 13 months
+        cutoff = datetime.today() - timedelta(days=400)
+        s = s[s.index >= cutoff]
         if len(s) < 2:
             return None
         return s
@@ -93,7 +143,7 @@ def plot_panel(ax, series, n_days, name):
 
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=7)
 
-    # Stats text box
+    # Stats text box (top-left)
     delta_pct = (vals[-1] - vals[0]) / vals[0] * 100
     sign = "+" if delta_pct >= 0 else ""
     hi_val = fmt_price(name, vals.max())
@@ -108,6 +158,19 @@ def plot_panel(ax, series, n_days, name):
         bbox=dict(boxstyle="square,pad=0.3", facecolor="white", edgecolor="none"),
     )
 
+    # Description label (bottom-center)
+    desc = DESCRIPTIONS.get(name, "")
+    if desc:
+        ax.text(
+            0.5, 0.02, desc,
+            transform=ax.transAxes,
+            fontsize=6,
+            color="#666666",
+            ha="center",
+            va="bottom",
+            style="italic",
+        )
+
     # Clean spines and grid
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -116,9 +179,10 @@ def plot_panel(ax, series, n_days, name):
 
 
 def save_charts(today_str, data, out_path):
-    """Generate a 6×2 PDF chart (1M left, 1Y right) for all indicators."""
-    fig, axes = plt.subplots(6, 2, figsize=(13, 18))
-    fig.suptitle(f"Macro Snapshot — {today_str}", fontsize=14, fontweight="bold", y=0.995)
+    """Generate an N×2 PDF chart (1M left, 1Y right) for all indicators."""
+    n_rows = len(ORDER)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(13, n_rows * 2.6))
+    fig.suptitle(f"Macro Snapshot — {today_str}", fontsize=14, fontweight="bold", y=0.999)
 
     # Column headers
     axes[0, 0].set_title("1 Month", fontsize=10, fontweight="bold")
@@ -139,7 +203,7 @@ def save_charts(today_str, data, out_path):
         plot_panel(axes[row, 0], s, n_days=22,  name=name)
         plot_panel(axes[row, 1], s, n_days=252, name=name)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.995])
+    fig.tight_layout(rect=[0, 0, 1, 0.998])
     fig.savefig(out_path, format="pdf", bbox_inches="tight")
     plt.close(fig)
 
@@ -205,6 +269,14 @@ def build_report(today_str, data):
             f"- Real rates {direction} ({fmt_pct(tnx_r20)} 20D)：通常对黄金偏{'压制' if tnx_r20 > 0 else '支撑'}"
         )
 
+    # 2Y-10Y spread (yield curve inversion signal)
+    two_s = data.get("2Y Yield (DGS2)")
+    if two_s is not None and tnx_s is not None:
+        spread = tnx_s.iloc[-1] - two_s.iloc[-1]
+        sign = "+" if spread >= 0 else ""
+        shape = "正常（未倒挂）" if spread >= 0 else "倒挂（衰退信号）"
+        lines.append(f"- 2Y-10Y 利差：{sign}{spread:.2f}% — 曲线{shape}")
+
     dxy_s = data.get("DXY")
     dxy_r20 = pct_change(dxy_s, 20) if dxy_s is not None else None
     if dxy_r20 is not None:
@@ -230,7 +302,7 @@ def build_report(today_str, data):
 
     lines.append("")
     lines.append("---")
-    lines.append(f"*Generated: {today_str} | Data: yfinance | Lean Week 1*")
+    lines.append(f"*Generated: {today_str} | Data: yfinance + FRED | Lean Week 1*")
 
     return "\n".join(lines)
 
@@ -240,9 +312,16 @@ def main():
 
     print(f"Fetching data for {today_str}...")
     data = {}
+
     for name, ticker in TICKERS.items():
         print(f"  {name} ({ticker})...", end=" ", flush=True)
         s = fetch_series(ticker)
+        data[name] = s
+        print("ok" if s is not None else "FAILED")
+
+    for name, series_id in FRED_SERIES.items():
+        print(f"  {name} (FRED:{series_id})...", end=" ", flush=True)
+        s = fetch_fred_series(series_id)
         data[name] = s
         print("ok" if s is not None else "FAILED")
 
